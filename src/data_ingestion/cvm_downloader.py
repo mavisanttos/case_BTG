@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 """
-download_cvm_data.py
---------------------
 Download, extração e análise focada exclusivamente nos dados de Ofertas Públicas
 de Distribuição da CVM sob a nova Resolução CVM 160 (Rito automático de 2023 em diante).
 

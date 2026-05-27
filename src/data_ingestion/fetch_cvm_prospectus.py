@@ -11,12 +11,6 @@ e descobrir os endpoints corretos automaticamente.
 Instalação:
     pip install playwright requests
     playwright install chromium
-
-Uso:
-    python baixar_prospecto_cvm.py 24583
-    python baixar_prospecto_cvm.py 24583 --tipo "Prospecto Preliminar"
-    python baixar_prospecto_cvm.py 24583 --listar
-    python baixar_prospecto_cvm.py 24583 --headless false   # abre browser visível
 """
 
 import argparse

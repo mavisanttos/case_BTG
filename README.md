@@ -56,9 +56,9 @@ A organização modular do projeto divide as responsabilidades de captura, intel
 │   │   ├── components/         # Componentes React (analytics-tab, optimizer-tab)
 │   │   └── lib/                # Conexões, queries do Supabase e helpers de tipos
 │   └── data_ingestion/         # Pipeline de Ingestão e ETL (Python)
-│       ├── cvm_downloader.py           # Download automatizado de PDFs da CVM
-│       ├── fetch_cvm_prospectus.py     # Captura das tabelas cadastrais da CVM
-│       ├── generate_mock_prospectus.py # Emulador de extração para escala (Prevenção de limite de API)
+│       ├── cvm_downloader.py           # Download da tabela de ofertas da CVM
+│       ├── fetch_cvm_prospectus.py     # Download dos prospectos da CVM
+│       ├── generate_mock_prospectus.py # Emulador de extração para escala (Prevenção de limite de API) - Utilização apenas para fins de demonstração
 │       ├── macro_indicators_fetcher.py # Coleta de indicadores exógenos (CDI, Selic, IPCA)
 │       └── sync_supabase.py            # Script de carga e sincronização com o banco
 ├── .env                        # Variáveis de ambiente (Chaves de API e Supabase)
