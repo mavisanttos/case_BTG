@@ -1,318 +1,493 @@
 #!/usr/bin/env python3
 """
-market_agent.py
----------------
-Agente de Chat inteligente da BTG Pactual Intelligence.
-Orquestrado via LangChain e LangGraph, consome dados consolidados de:
-  1. Metadados Regulatórios CVM (modern_offers_rcvm160.csv)
-  2. Métricas Profundas de Prospectos e Scores (prospectos_extraidos.csv)
-  3. Indicadores Macroeconômicos Diários (daily_indicators.json)
+prospect_agent.py
+-----------------
+Agente de extração de Prospectos CVM usando Gemini com PDF nativo.
 
-Utiliza a API do Gemini 2.5 Flash como motor de raciocínio.
+Estratégia principal: envia o PDF diretamente para o Gemini via File API.
+O modelo lê o documento com visão nativa — tabelas, colunas e formatação
+são interpretados corretamente, sem perda de estrutura pelo pdfplumber.
+
+Fallback automático: se o upload falhar, extrai texto com pdfplumber
+e envia como texto (comportamento anterior).
+
+Instalação:
+    pip install google-genai pdfplumber
+
+Uso:
+    python prospect_agent.py                 # processa PDFs novos
+    python prospect_agent.py --apagar-pdfs   # apaga PDF após processar
+    python prospect_agent.py --dry-run       # lista PDFs sem chamar API
+    python prospect_agent.py --reprocessar   # reprocessa já processados
+    python prospect_agent.py --modo texto    # força modo texto (sem upload)
+
+Variável de ambiente:
+    export GEMINI_API_KEY="AIzaSy..."
 """
 
+import argparse
+import csv
 import json
 import os
-import sys
 import re
+import sys
+import time
 import unicodedata
-import warnings
 from pathlib import Path
-import pandas as pd
-from dotenv import load_dotenv
-from langchain_core.tools import tool
-
-# Ignora warnings de depreciação do LangGraph/LangChain
-with warnings.catch_warnings():
-    warnings.simplefilter("ignore")
-    from langgraph.prebuilt import create_react_agent
 
 try:
-    from langchain_google_genai import ChatGoogleGenerativeAI
+    from google import genai
+    from google.genai import types
 except ImportError:
-    print("[ERRO] Biblioteca 'langchain-google-genai' não instalada.")
-    print("       Execute: pip install langchain-google-genai")
+    print("[ERRO] Execute: pip install google-genai")
     sys.exit(1)
 
-# ─── Configuração de Caminhos e Ambiente ──────────────────────────────────────
+try:
+    import pdfplumber
+    PDFPLUMBER_OK = True
+except ImportError:
+    PDFPLUMBER_OK = False
+
+# ── Caminhos do projeto ────────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-load_dotenv(PROJECT_ROOT / ".env")
-DATA_DIR = PROJECT_ROOT / "data"
+PDF_DIR      = PROJECT_ROOT / "data" / "cvm" / "pdf_prospectos"
+CSV_OUT      = PROJECT_ROOT / "data" / "cvm" / "prospectos_extraidos.csv"
 
-# Developer Quality of Life: Mapeia GEMINI_API_KEY para GOOGLE_API_KEY usada pelo LangChain
-if "GEMINI_API_KEY" in os.environ and "GOOGLE_API_KEY" not in os.environ:
-    os.environ["GOOGLE_API_KEY"] = os.environ["GEMINI_API_KEY"]
+# ── Modelo ─────────────────────────────────────────────────────────────────
+MODELO = "gemini-2.0-flash"
+# Limite de chars no modo texto (fallback) — Gemini 2.0 Flash: 1M tokens
+MAX_CHARS_TEXTO = 400_000
 
-# ─── Inicialização e Fusão Inteligente de Dados ────────────────────────────────
+# ── Campos a extrair ───────────────────────────────────────────────────────
+CAMPOS = {
+    # Precificação e retorno
+    "preco_emissao":                    "Preço de emissão por cota (R$). Ex: 'R$ 100,00'",
+    "valor_patrimonial_cota":           "Valor patrimonial por cota (VP/C) na data de referência (R$)",
+    "pvp_oferta":                       "P/VP = Preço de emissão ÷ VP/C. Número decimal. Ex: 0.97",
+    "dy_projetado_pct":                 "DY projetado anual sobre o preço de emissão. Número decimal. Ex: 9.5",
+    "taxa_administracao":               "Taxa de administração anual. Ex: '0,75% a.a.'",
+    "taxa_performance":                 "Taxa de performance com benchmark. Ex: '20% sobre IFIX+2%'",
+    "custo_total_oferta_pct":           "Custo total da oferta (comissões + despesas) como % do montante",
 
-CVM_PATH = DATA_DIR / "cvm" / "modern_offers_rcvm160.csv"
-PROSPECTOS_PATH = DATA_DIR / "cvm" / "prospectos_extraidos.csv"
-MACRO_PATH = DATA_DIR / "macro" / "daily_indicators.json"
+    # Estrutura da oferta
+    "montante_total":                   "Montante total máximo da oferta (R$)",
+    "montante_minimo":                  "Montante mínimo para não cancelamento (R$)",
+    "lote_base":                        "Montante do lote base / oferta inicial (R$)",
+    "lote_adicional":                   "Lote adicional ou opção de acréscimo (R$)",
+    "numero_cotas_ofertadas":           "Número total de cotas ofertadas",
+    "numero_emissao":                   "Número ordinal da emissão. Ex: 1, 2, 3",
+    "prazo_oferta_dias":                "Prazo de duração da oferta em dias corridos",
+    "cronograma_resumido":              "Datas-chave: início, encerramento, liquidação. Ex: 'Início: 10/02/2026 | Encerramento: 10/04/2026'",
+    "condicao_encerramento_antecipado": "Condições para encerramento antecipado da oferta",
+    "direito_preferencia":              "Cotistas têm direito de preferência? (sim/não) e prazo em dias",
+    "regime_distribuicao":              "Regime: 'melhores esforços' ou 'garantia firme'",
+    "data_primeiro_rendimento":         "Data prevista do primeiro pagamento de rendimentos",
 
-# 1. Carrega Indicadores Macro
-if MACRO_PATH.exists():
-    with open(MACRO_PATH, encoding="utf-8") as f:
-        _macro_indicators = json.load(f)
-else:
-    _macro_indicators = {}
+    # Tipo e portfólio
+    "tipo_fii":                         "Tipo de FII: tijolo, papel, híbrido ou FOF",
+    "tipo_ativo_alvo":                  "Tipo de ativo principal. Ex: galpões logísticos, CRI IPCA, lajes corporativas",
+    "localizacao_geografica":           "Estados/cidades dos ativos. Ex: 'SP (70%), RJ (30%)'",
+    "destinacao_recursos":              "Destinação detalhada: % para aquisição, % obras, % CRI, % caixa, etc.",
+    "pipeline_ativos":                  "Ativos-alvo ou pipeline: nome, localização, tipo e valor estimado",
 
-# 2. Carrega e une as tabelas da CVM e de Prospectos Extraídos
-_df_merged = pd.DataFrame()
+    # Qualidade operacional — tijolo
+    "vacancia_fisica_pct":              "Vacância física atual (%). null se FII de papel",
+    "vacancia_financeira_pct":          "Vacância financeira atual (%). null se FII de papel",
+    "prazo_medio_contratos":            "Prazo médio ponderado dos contratos de locação (anos ou meses)",
+    "tipo_contrato":                    "Tipo predominante: típico, atípico, built-to-suit, sale-leaseback",
+    "indexador_predominante":           "Indexador dos contratos: IPCA, IGP-M, CDI, prefixado",
+    "maior_inquilino_pct":              "Maior inquilino e % da receita. Ex: 'Ambev — 28%'",
+    "hedge_cambial":                    "Existe hedge cambial? (sim/não/não aplicável) e detalhes",
 
-if CVM_PATH.exists():
-    df_cvm = pd.read_csv(CVM_PATH, sep=";")
-    df_cvm["Numero_Requerimento"] = df_cvm["Numero_Requerimento"].astype(str).str.strip()
-    
-    if PROSPECTOS_PATH.exists():
-        df_pros = pd.read_csv(PROSPECTOS_PATH, sep=";")
-        
-        # Extrai o id numérico de 'prospecto_{id}.pdf' para bater com o Numero_Requerimento da CVM
-        df_pros["Numero_Requerimento"] = df_pros["arquivo_pdf"].astype(str).str.extract(r'prospecto_(\d+)\.pdf')
-        df_pros["Numero_Requerimento"] = df_pros["Numero_Requerimento"].fillna("").str.strip()
-        
-        # Merge interno: Traz metadados da CVM + Métricas profundas extraídas/simuladas
-        _df_merged = pd.merge(df_cvm, df_pros, on="Numero_Requerimento", how="inner")
-        print(f"[AGENTE] Fusão concluída com sucesso: {_df_merged.shape[0]} ofertas consolidadas disponíveis.")
-    else:
-        _df_merged = df_cvm
-        print("[AGENTE] Alerta: Apenas dados regulatórios carregados. Planilha de prospectos ausente.")
-else:
-    print("[AGENTE] Erro crítico: Base regulatória CVM não encontrada.")
+    # Qualidade de crédito — papel
+    "ltv_medio_pct":                    "LTV médio da carteira de CRIs (%). null se FII de tijolo",
+    "indexador_carteira_papel":         "Composição: % IPCA vs % CDI vs outros. null se tijolo",
+    "maior_devedor_pct":                "Maior devedor/emissor de CRI e % na carteira. null se tijolo",
+    "rating_medio_cris":                "Rating médio dos CRIs em carteira. null se tijolo",
+    "garantias_cri":                    "Garantias dos CRIs: alienação fiduciária, fiança, aval. null se tijolo",
 
+    # Histórico
+    "rendimentos_ultimos_12m":          "Rendimentos pagos nos últimos 12 meses (R$/cota). null se 1ª emissão",
+    "cotacao_mercado_ref":              "Cotação na B3 na data de referência (R$). null se 1ª emissão",
+    "patrimonio_liquido_atual":         "Patrimônio líquido antes da oferta (R$). null se 1ª emissão",
+    "pvp_historico_medio":              "P/VP médio histórico dos últimos 12 meses. null se 1ª emissão",
 
-# ─── Ferramentas do Agente (Tools) ───────────────────────────────────────────
+    # Risco
+    "fatores_risco_principais":         "3 a 5 principais fatores de risco, separados por ' | '",
+    "concentracao_geografica":          "Risco de concentração geográfica mencionado",
+    "concentracao_indexador":           "Risco de concentração em único indexador mencionado",
+}
 
-@tool
-def market_macro_indicators() -> str:
-    """
-    Retorna os indicadores macroeconômicos oficiais do Brasil (Meta Selic, CDI e IPCA acumulado).
-    Use sempre que o usuário perguntar sobre as taxas básicas, inflação ou benchmarks de rentabilidade.
-    """
-    if not _macro_indicators:
-        return "Indicadores macroeconômicos não disponíveis no momento."
-    
-    return (
-        f"INDICADORES MACROECONÔMICOS ATUAIS (Fonte: Banco Central):\n"
-        f"- Meta Taxa Selic: {_macro_indicators.get('selic_meta', 'N/D')}% a.a.\n"
-        f"- Taxa DI / CDI: {_macro_indicators.get('cdi_daily', 'N/D')}% a.a.\n"
-        f"- Inflação IPCA (acumulada 12 meses): {_macro_indicators.get('ipca_12m', 'N/D')}%"
-    )
+# ── System prompt ──────────────────────────────────────────────────────────
+SYSTEM_PROMPT = """\
+Você é um analista sênior de FII (Fundos de Investimento Imobiliário) brasileiro.
+Sua tarefa é extrair dados de Prospectos de Oferta Pública (CVM Resolução 160).
 
+REGRAS — leia com atenção:
+1. Extraia APENAS dados explicitamente presentes no documento. NUNCA invente ou calcule.
+2. Dado não encontrado → null (valor JSON nulo, sem aspas).
+3. Retorne EXCLUSIVAMENTE um objeto JSON válido. Sem texto antes ou depois. Sem markdown.
+4. Monetário: string com "R$". Ex: "R$ 100,00" ou "R$ 1.500.000.000,00"
+5. Percentuais simples: número decimal. Ex: 9.5 (não "9,5%")
+6. Percentuais com contexto textual: string. Ex: "0,75% a.a. sobre o PL"
+7. Listas: itens separados por " | " numa única string
+8. FII de tijolo → campos de papel = null. FII de papel → campos de tijolo = null.
 
-@tool
-def search_fii_offers(tipo_fii: str = "", score_minimo: int = 0, limite: int = 5) -> str:
-    """
-    Busca, filtra e ordena ofertas de FIIs consolidadas.
-    Parâmetros:
-      - tipo_fii: 'Tijolo' ou 'Papel' (vazio busca ambos)
-      - score_minimo: Filtra por qualidade mínima de atratividade (0 a 100)
-    Retorna uma tabela markdown limpa com preços, yield, P/VP, score e links oficiais.
-    """
-    if _df_merged.empty:
-        return "Banco de dados consolidado indisponível."
-
-    df = _df_merged.copy()
-
-    # Aplica filtro de tipo de FII (case-insensitive)
-    if tipo_fii:
-        tipo_limpo = tipo_fii.strip().lower()
-        df = df[df["tipo_fii"].fillna("").str.lower().str.contains(tipo_limpo)]
-
-    # Aplica filtro de Score BTG
-    if score_minimo > 0:
-        df["score_oferta_num"] = pd.to_numeric(df["score_oferta"], errors="coerce").fillna(0)
-        df = df[df["score_oferta_num"] >= score_minimo]
-
-    if df.empty:
-        return "Nenhuma oferta localizada que corresponda aos filtros informados."
-
-    # Ordena pelo melhor score (atratividade técnica)
-    df["score_sort"] = pd.to_numeric(df["score_oferta"], errors="coerce").fillna(0)
-    df = df.sort_values("score_sort", ascending=False).head(limite)
-
-    cols = [
-        "Numero_Requerimento", "Nome_Emissor", "tipo_fii", "preco_emissao",
-        "pvp_oferta", "dy_projetado_pct", "score_oferta", "link_oferta_cvm"
-    ]
-    
-    resultado = df[cols].copy()
-    resultado.columns = ["Req CVM", "Fundo Imobiliário", "Segmento", "Preço", "P/VP", "DY Proj (%)", "Score BTG", "Link Oficial CVM"]
-
-    tabela_md = resultado.to_markdown(index=False)
-    return f"Principais ofertas localizadas no mercado (Ordenadas por Score de Atratividade):\n\n{tabela_md}"
-
-
-@tool
-def query_specific_offer_details(termo_busca: str) -> str:
-    """
-    Busca detalhes minuciosos e qualitativos de uma única oferta específica usando o nome do Fundo ou o ID do Requerimento.
-    Retorna dados operacionais, pipeline de ativos, vacância/LTV, custos de estruturação, taxas e fatores de risco.
-    """
-    if _df_merged.empty:
-        return "Base consolidada indisponível."
-
-    # Remove acentos para busca flexível
-    def clean_text(s):
-        if pd.isna(s): return ""
-        return "".join(c for c in unicodedata.normalize("NFD", str(s)) if unicodedata.category(c) != "Mn").lower().strip()
-
-    termo_limpo = clean_text(termo_busca)
-    
-    df = _df_merged.copy()
-    df["busca_emissor"] = df["Nome_Emissor"].apply(clean_text)
-    df["busca_req"] = df["Numero_Requerimento"].apply(clean_text)
-
-    # Procura por ID ou Nome do Emissor
-    match_df = df[(df["busca_emissor"].str.contains(termo_limpo)) | (df["busca_req"] == termo_limpo)]
-
-    if match_df.empty:
-        return f"Não foi possível localizar nenhuma oferta sob o termo '{termo_busca}'."
-
-    # Pega o primeiro match
-    oferta = match_df.iloc[0]
-    tipo = str(oferta.get("tipo_fii", "Tijolo"))
-
-    relatorio = [
-        f"🏛️ DETALHAMENTO DE OFERTA: {oferta['Nome_Emissor']} (Req CVM: {oferta['Numero_Requerimento']})",
-        f"=========================================================================",
-        f"• Segmento FII:          {tipo}",
-        f"• Coordenador Líder:     {oferta.get('Nome_Lider', 'Não Informado')}",
-        f"• Preço de Emissão:      {oferta.get('preco_emissao', 'N/A')}",
-        f"• Valor Patrimonial:     {oferta.get('valor_patrimonial_cota', 'N/A')} | P/VP: {oferta.get('pvp_oferta', 'N/A')}",
-        f"• Dividend Yield Proj:   {oferta.get('dy_projetado_pct', 'N/A')}% a.a.",
-        f"• Taxas da Emissão:      Adm: {oferta.get('taxa_administracao', 'N/A')} | Perf: {oferta.get('taxa_performance', 'N/A')}",
-        f"• Custo de Distribuição: {oferta.get('custo_total_oferta_pct', 'N/A')}% do montante captado",
-        f"• Montante Máximo:       {oferta.get('montante_total', 'N/A')}",
-        f"• Lote Base / Adicional: Base: {oferta.get('lote_base', 'N/A')} | Adicional: {oferta.get('lote_adicional', 'N/A')}",
-        f"• Regime / Cronograma:   {oferta.get('regime_distribuicao', 'N/A')} | {oferta.get('cronograma_resumido', 'N/A')}",
-        f"• Destinação Recursos:   {oferta.get('destinacao_recursos', 'N/A')}",
-        f"• Pipeline de Ativos:    {oferta.get('pipeline_ativos', 'N/A')}",
-    ]
-
-    if tipo == "Tijolo":
-        relatorio.extend([
-            f"\n📊 Métricas Operacionais (Tijolo):",
-            f"  - Vacância Física:     {oferta.get('vacancia_fisica_pct', 'N/A')}% | Financeira: {oferta.get('vacancia_financeira_pct', 'N/A')}%",
-            f"  - Prazo Médio Contratos:{oferta.get('prazo_medio_contratos', 'N/A')}",
-            f"  - Perfil Contratos:     {oferta.get('tipo_contrato', 'N/A')} | Indexador: {oferta.get('indexador_predominante', 'N/A')}",
-            f"  - Principal Inquilino:  {oferta.get('maior_inquilino_pct', 'N/A')}",
-        ])
-    else:
-        relatorio.extend([
-            f"\n📊 Métricas de Crédito (Papel/CRIs):",
-            f"  - LTV Médio Carteira:   {oferta.get('ltv_medio_pct', 'N/A')}%",
-            f"  - Indexador Carteira:   {oferta.get('indexador_carteira_papel', 'N/A')}",
-            f"  - Maior Devedor:        {oferta.get('maior_devedor_pct', 'N/A')}",
-            f"  - Rating Médio CRIs:    {oferta.get('rating_medio_cris', 'N/A')}",
-            f"  - Garantias do Lastro:  {oferta.get('garantias_cri', 'N/A')}",
-        ])
-
-    relatorio.extend([
-        f"\n⚠️ Análise de Risco & Links:",
-        f"  - Fatores de Risco:     {oferta.get('fatores_risco_principais', 'N/A')}",
-        f"  - Concentração:         Geográfica: {oferta.get('concentracao_geografica', 'N/A')} | Indexador: {oferta.get('concentracao_indexador', 'N/A')}",
-        f"  - Score BTG de Crédito: {oferta.get('score_oferta', 'N/A')}/100",
-        f"  - Link do Portal CVM:   {oferta.get('link_oferta_cvm', 'N/A')}",
-        f"  - Download do PDF:      {oferta.get('link_pdf_download', 'N/A')}"
-    ])
-
-    return "\n".join(relatorio)
-
-
-@tool
-def compare_fii_offers(lista_requerimentos: list[str]) -> str:
-    """
-    Faz uma tabela de comparação lado a lado de 2 a 3 ofertas de FIIs de forma direta.
-    Parâmetro: lista de códigos de requerimento (ex: ['392', '401', '402'])
-    """
-    if _df_merged.empty:
-        return "Base consolidada indisponível."
-
-    reqs = [str(r).strip() for r in lista_requerimentos]
-    df = _df_merged[_df_merged["Numero_Requerimento"].isin(reqs)].copy()
-
-    if df.empty:
-        return "Nenhum dos requerimentos informados foi localizado para comparação."
-
-    # Configura o dataframe para comparação transposta
-    df_compare = df[[
-        "Numero_Requerimento", "Nome_Emissor", "tipo_fii", "preco_emissao", "pvp_oferta",
-        "dy_projetado_pct", "custo_total_oferta_pct", "montante_total", "score_oferta"
-    ]].copy()
-
-    df_compare.columns = [
-        "Req CVM", "Fundo", "Tipo", "Preço", "P/VP", "Yield Proj", "Custo Emissão", "Montante Total", "Score BTG"
-    ]
-
-    # Transpõe para exibição vertical comparativa lado a lado (padrão BTG)
-    df_transposed = df_compare.set_index("Fundo").T
-    tabela_md = df_transposed.to_markdown()
-
-    return f"Comparação lado a lado das ofertas solicitadas:\n\n{tabela_md}"
-
-
-# ─── Construção do Agente ReAct (Gemini 2.5 Flash) ───────────────────────────
-
-def build_market_agent():
-    """Instancia o agente de chat configurado com as ferramentas e o Gemini."""
-    if not os.environ.get("GOOGLE_API_KEY"):
-        raise EnvironmentError("[ERRO] Variável de ambiente GEMINI_API_KEY ou GOOGLE_API_KEY não localizada.")
-
-    # Inicializa o Gemini 2.5 Flash de produção estável via LangChain
-    llm = ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash",
-        temperature=0.0
-    )
-
-    tools = [
-        market_macro_indicators,
-        search_fii_offers,
-        query_specific_offer_details,
-        compare_fii_offers
-    ]
-
-    system_prompt = """Você é o Analista de Crédito e Inteligência de Mercado Sênior do BTG Pactual.
-Sua missão é dar respostas precisas, altamente corporativas, lógicas e técnicas sobre o mercado de ofertas primárias de Fundos Imobiliários (FIIs).
-
-Fontes de dados vivas que você possui (carregadas localmente via Python):
-1. Base Consolidada CVM + Prospectos (modern_offers_rcvm160.csv + prospectos_extraidos.csv):
-   - Contém metadados de emissores, coordenadores, preços, P/VP, dividend yield, custos de captação, vacância, LTV de CRIs e o exclusivo Score BTG de atratividade de crédito de cada oferta (0 a 100).
-2. Indicadores Macro do Banco Central: Selic, CDI e IPCA para servir de benchmark de comparação.
-
-Diretrizes de Comportamento & Tom:
-- Adote um tom de banco de atacado/private banking: analítico, sóbrio, objetivo e focado em risco-retorno.
-- Nunca faça suposições ("acho", "talvez"). Se a informação não estiver na base, responda com clareza técnica de que o dado não foi declarado no prospecto (null).
-- Sempre invoque as ferramentas adequadas de dados antes de responder a perguntas sobre emissores, taxas, rankings ou comparações.
-- Quando exibir tabelas de dados estruturados gerados pelas ferramentas, repasse-as integralmente e limpas no formato Markdown recebido.
-
-Regras de Negócio Importantes:
-1. Ao sugerir ofertas de investimento, ordene-as prioritariamente usando o 'Score BTG' (atratividade técnica calculada pelo nosso algoritmo de análise de crédito).
-2. Use a ferramenta 'query_specific_offer_details' sempre que o usuário pedir detalhes profundos de uma oferta (como carteira de ativos, inquilinos, garantias reais de CRIs, riscos imobiliários ou links).
-3. Caso o usuário queira confrontar ou comparar mais de uma oferta, use a ferramenta 'compare_fii_offers'.
-4. Seja direto na resposta: ignore frases como "pesquisando na base de dados...". Traga a resposta técnica imediatamente.
+ONDE PROCURAR cada bloco no prospecto:
+- Preço, VP/C, P/VP → seção "Preço de Emissão" ou tabela de características da cota
+- DY projetado → seção de rentabilidade estimada ou estudo de viabilidade  
+- Taxas → seção "Taxas e Encargos" ou "Remuneração do Administrador"
+- Montantes e lotes → seção "Características da Oferta" ou tabela de distribuição
+- Cronograma → tabela "Cronograma Tentativo"
+- Destino dos recursos → seção "Destinação dos Recursos"
+- Vacância, contratos → seção "Portfólio" ou "Imóveis Integrantes"
+- LTV, rating, garantias → seção "Carteira" ou "Ativos Alvo" (papel)
+- Fatores de risco → seção "Fatores de Risco"
+- Histórico → seção "Informações sobre o Fundo" ou "Desempenho Histórico"
 """
 
-    return create_react_agent(llm, tools, prompt=system_prompt)
+
+def montar_prompt_texto(texto: str, nome: str) -> str:
+    campos_desc = "\n".join(f'  "{k}": "{v}"' for k, v in CAMPOS.items())
+    return (
+        f"Analise o Prospecto '{nome}' abaixo e preencha o JSON:\n\n"
+        f"{{\n{campos_desc}\n}}\n\n"
+        f"TEXTO DO PROSPECTO:\n{texto}\n\n"
+        "Retorne SOMENTE o JSON. Sem markdown."
+    )
 
 
-# ─── Execução e Demonstração do Agente ───────────────────────────────────────
+def montar_prompt_pdf(nome: str) -> str:
+    campos_desc = "\n".join(f'  "{k}": "{v}"' for k, v in CAMPOS.items())
+    return (
+        f"Analise o Prospecto de FII '{nome}' (PDF em anexo) e preencha o JSON:\n\n"
+        f"{{\n{campos_desc}\n}}\n\n"
+        "Retorne SOMENTE o JSON. Sem markdown."
+    )
+
+
+# ── Extração de texto fallback (pdfplumber) ────────────────────────────────
+
+ANCORAS = [re.compile(p, re.IGNORECASE) for p in [
+    r"preço de emissão", r"valor patrimonial", r"pvp", r"dy projetado",
+    r"taxa de administração", r"taxa de performance", r"custos da oferta",
+    r"características da oferta", r"montante", r"lote", r"cronograma",
+    r"direito de preferência", r"destinação dos recursos", r"portfólio",
+    r"vacância", r"contratos de locação", r"inquilinos", r"ltv",
+    r"loan.to.value", r"fatores de risco", r"patrimônio líquido",
+    r"histórico de rendimentos", r"carteira", r"pipeline", r"garantias",
+]]
+
+
+def extrair_texto_pdf_fallback(caminho: Path, max_chars: int = MAX_CHARS_TEXTO) -> str:
+    if not PDFPLUMBER_OK:
+        print("    [ERRO] pdfplumber não instalado. Execute: pip install pdfplumber")
+        return ""
+
+    paginas = []
+    try:
+        with pdfplumber.open(caminho) as pdf:
+            print(f"    PDF aberto: {len(pdf.pages)} páginas (modo texto)")
+            for i, page in enumerate(pdf.pages):
+                txt = page.extract_text() or ""
+                if txt.strip():
+                    paginas.append((i + 1, txt))
+    except Exception as e:
+        print(f"    [ERRO] pdfplumber: {e}")
+        return ""
+
+    texto_total = "\n".join(f"\n--- Página {n} ---\n{t}" for n, t in paginas)
+
+    if len(texto_total) <= max_chars:
+        return texto_total
+
+    # Filtro inteligente: páginas com âncoras + janela de 3 páginas seguintes
+    print(f"    Texto grande ({len(texto_total):,} chars). Filtrando seções relevantes...")
+    indices = set()
+    for i, (_, txt) in enumerate(paginas):
+        t_norm = unicodedata.normalize("NFKD", txt).encode("ascii","ignore").decode().lower()
+        if any(a.search(t_norm) for a in ANCORAS):
+            for j in range(i, min(i + 4, len(paginas))):
+                indices.add(j)
+
+    selecionadas = [paginas[i] for i in sorted(indices)]
+
+    # Fallback sequencial se filtro resultou em pouco texto
+    if sum(len(t) for _, t in selecionadas) < 15_000:
+        print("    Filtro insuficiente. Usando primeiras 60 páginas.")
+        selecionadas = paginas[:60]
+
+    texto = "\n".join(f"\n--- Página {n} ---\n{t}" for n, t in selecionadas)
+
+    # Sempre inclui as 8 primeiras páginas para contexto geral
+    primeiros_nums = {n for n, _ in selecionadas}
+    inicio = "\n".join(
+        f"\n--- Página {n} ---\n{t}"
+        for n, t in paginas[:8] if n not in primeiros_nums
+    )
+    return (inicio + "\n" + texto)[:max_chars]
+
+
+# ── Chamada ao Gemini ──────────────────────────────────────────────────────
+
+def _limpar_json(raw: str) -> dict:
+    """Limpa markdown residual e extrai o objeto JSON da resposta."""
+    raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
+    raw = re.sub(r"\s*```\s*$",        "", raw, flags=re.MULTILINE)
+    raw = raw.strip()
+    m = re.search(r"\{[\s\S]*\}", raw)
+    if m:
+        raw = m.group(0)
+    dados = json.loads(raw)
+    for k in CAMPOS:
+        if k not in dados:
+            dados[k] = None
+    return dados
+
+
+def chamar_gemini_pdf(client, caminho_pdf: Path, nome: str, max_tentativas=3) -> dict | None:
+    """
+    Estratégia principal: faz upload do PDF para a File API do Gemini
+    e pede extração diretamente sobre o documento nativo.
+    Retorna None se o upload falhar (aciona fallback).
+    """
+    arquivo_gemini = None
+    try:
+        print("    Fazendo upload do PDF para o Gemini File API...")
+        arquivo_gemini = client.files.upload(
+            file=str(caminho_pdf),
+            config=types.UploadFileConfig(mime_type="application/pdf"),
+        )
+
+        # Aguarda o arquivo ficar ativo
+        for _ in range(20):
+            estado = client.files.get(name=arquivo_gemini.name)
+            if estado.state.name == "ACTIVE":
+                break
+            time.sleep(2)
+        else:
+            print("    [AVISO] Arquivo não ficou ACTIVE a tempo. Usando fallback.")
+            return None
+
+        print("    PDF ativo no Gemini. Extraindo campos...")
+
+        for tentativa in range(1, max_tentativas + 1):
+            try:
+                resp = client.models.generate_content(
+                    model=MODELO,
+                    contents=[
+                        types.Content(role="user", parts=[
+                            types.Part(text=SYSTEM_PROMPT + "\n\n" + montar_prompt_pdf(nome)),
+                            types.Part(file_data=types.FileData(
+                                file_uri=arquivo_gemini.uri,
+                                mime_type="application/pdf",
+                            )),
+                        ]),
+                    ],
+                    config=types.GenerateContentConfig(
+                        temperature=0.0,
+                        max_output_tokens=8192,
+                        response_mime_type="application/json",
+                    ),
+                )
+                dados = _limpar_json(resp.text.strip())
+                preenchidos = sum(1 for v in dados.values() if v is not None and str(v).strip() not in ("","null"))
+                print(f"    Modo PDF nativo: {preenchidos}/{len(CAMPOS)} campos")
+                return dados
+
+            except json.JSONDecodeError as e:
+                print(f"    [AVISO] JSON inválido tentativa {tentativa}: {e}")
+                if tentativa < max_tentativas:
+                    time.sleep(3 * tentativa)
+            except Exception as e:
+                print(f"    [AVISO] Erro Gemini tentativa {tentativa}: {e}")
+                if tentativa < max_tentativas:
+                    time.sleep(5 * tentativa)
+
+    except Exception as e:
+        print(f"    [AVISO] Upload falhou: {e}. Ativando fallback texto.")
+        return None
+    finally:
+        # Sempre limpa o arquivo do Gemini para não acumular cota
+        if arquivo_gemini:
+            try:
+                client.files.delete(name=arquivo_gemini.name)
+            except Exception:
+                pass
+
+    return None
+
+
+def chamar_gemini_texto(client, texto: str, nome: str, max_tentativas=3) -> dict:
+    """
+    Fallback: envia o texto extraído pelo pdfplumber.
+    Usado quando o upload do PDF falha.
+    """
+    print("    Modo texto (fallback pdfplumber)...")
+    prompt = SYSTEM_PROMPT + "\n\n" + montar_prompt_texto(texto, nome)
+
+    for tentativa in range(1, max_tentativas + 1):
+        try:
+            resp = client.models.generate_content(
+                model=MODELO,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0.0,
+                    max_output_tokens=8192,
+                    response_mime_type="application/json",
+                ),
+            )
+            dados = _limpar_json(resp.text.strip())
+            preenchidos = sum(1 for v in dados.values() if v is not None and str(v).strip() not in ("","null"))
+            print(f"    Modo texto: {preenchidos}/{len(CAMPOS)} campos")
+            return dados
+
+        except json.JSONDecodeError as e:
+            print(f"    [AVISO] JSON inválido tentativa {tentativa}: {e}")
+            if tentativa < max_tentativas:
+                time.sleep(3 * tentativa)
+        except Exception as e:
+            msg = str(e)
+            wait = 60
+            m_wait = re.search(r"try again in ([\d.]+)s", msg)
+            if m_wait:
+                wait = float(m_wait.group(1)) + 2
+            print(f"    [AVISO] Erro API tentativa {tentativa}: {e}")
+            if tentativa < max_tentativas:
+                print(f"    Aguardando {wait:.0f}s...")
+                time.sleep(wait)
+
+    print("    [ERRO] Todas as tentativas falharam.")
+    return {k: None for k in CAMPOS}
+
+
+# ── CSV incremental ────────────────────────────────────────────────────────
+
+def carregar_processados(csv_path: Path) -> set[str]:
+    if not csv_path.exists():
+        return set()
+    with open(csv_path, newline="", encoding="utf-8-sig") as f:
+        return {r.get("arquivo_pdf","") for r in csv.DictReader(f, delimiter=";") if r.get("arquivo_pdf")}
+
+
+def salvar_linha(csv_path: Path, linha: dict, colunas: list[str]):
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    novo = not csv_path.exists()
+    with open(csv_path, "a", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=colunas, delimiter=";", extrasaction="ignore")
+        if novo:
+            w.writeheader()
+        w.writerow(linha)
+
+
+# ── Pipeline por PDF ───────────────────────────────────────────────────────
+
+def processar_pdf(
+    caminho_pdf: Path,
+    client,
+    csv_path: Path,
+    colunas: list[str],
+    apagar_apos: bool = False,
+    forcar_texto: bool = False,
+) -> bool:
+    print(f"\n  Arquivo : {caminho_pdf.name}")
+    print(f"  Tamanho : {caminho_pdf.stat().st_size / 1024 / 1024:.1f} MB")
+
+    campos = None
+
+    # ── Estratégia 1: PDF nativo via File API ─────────────────────────────
+    if not forcar_texto:
+        campos = chamar_gemini_pdf(client, caminho_pdf, caminho_pdf.name)
+
+    # ── Estratégia 2: fallback texto (pdfplumber) ─────────────────────────
+    if campos is None:
+        texto = extrair_texto_pdf_fallback(caminho_pdf)
+        if not texto.strip():
+            print("  [ERRO] Sem texto extraível. PDF pode ser scaneado.")
+            return False
+        campos = chamar_gemini_texto(client, texto, caminho_pdf.name)
+
+    linha = {"arquivo_pdf": caminho_pdf.name, **{k: campos.get(k, "") or "" for k in CAMPOS}}
+    salvar_linha(csv_path, linha, colunas)
+    print(f"  ✓ Salvo no CSV")
+
+    if apagar_apos:
+        caminho_pdf.unlink()
+        print(f"  ✓ PDF removido")
+
+    return True
+
+
+# ── CLI ────────────────────────────────────────────────────────────────────
+
+def main():
+    ap = argparse.ArgumentParser(description="Agente de extração de Prospectos CVM → CSV")
+    ap.add_argument("--apagar-pdfs",  action="store_true", help="Apaga cada PDF após processar")
+    ap.add_argument("--dry-run",      action="store_true", help="Lista PDFs sem chamar API")
+    ap.add_argument("--reprocessar",  action="store_true", help="Reprocessa PDFs já no CSV")
+    ap.add_argument("--modo",         choices=["auto","texto"], default="auto",
+                    help="auto = PDF nativo + fallback texto | texto = só pdfplumber")
+    ap.add_argument("--pdf-dir",      type=Path, default=PDF_DIR)
+    ap.add_argument("--csv-out",      type=Path, default=CSV_OUT)
+    ap.add_argument("--pausa",        type=float, default=3.0,
+                    help="Segundos entre PDFs (padrão: 3)")
+    args = ap.parse_args()
+
+    args.pdf_dir.mkdir(parents=True, exist_ok=True)
+    pdfs = sorted(args.pdf_dir.glob("*.pdf"))
+
+    if not pdfs:
+        print(f"[AVISO] Nenhum PDF em: {args.pdf_dir}")
+        sys.exit(0)
+
+    ja_processados = set() if args.reprocessar else carregar_processados(args.csv_out)
+    pendentes = [p for p in pdfs if p.name not in ja_processados]
+
+    print(f"\n{'='*60}")
+    print(f"  Agente de Prospectos CVM — Gemini {MODELO}")
+    print(f"  PDFs na pasta  : {len(pdfs)}")
+    print(f"  Já processados : {len(ja_processados)}")
+    print(f"  A processar    : {len(pendentes)}")
+    print(f"  Modo           : {'texto (forçado)' if args.modo == 'texto' else 'PDF nativo + fallback'}")
+    print(f"  Saída CSV      : {args.csv_out}")
+    print(f"{'='*60}")
+
+    if not pendentes:
+        print("\nNada novo para processar. Use --reprocessar para forçar.")
+        sys.exit(0)
+
+    if args.dry_run:
+        print("\n[DRY-RUN] PDFs pendentes:")
+        for p in pendentes:
+            print(f"  • {p.name}  ({p.stat().st_size/1024/1024:.1f} MB)")
+        sys.exit(0)
+
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        print("\n[ERRO] GEMINI_API_KEY não definida.")
+        print("       Execute: export GEMINI_API_KEY='AIza...'")
+        sys.exit(1)
+
+    client = genai.Client(api_key=api_key)
+    colunas = ["arquivo_pdf"] + list(CAMPOS.keys())
+    forcar_texto = (args.modo == "texto")
+
+    sucesso = 0
+    for i, pdf in enumerate(pendentes, 1):
+        print(f"\n[{i}/{len(pendentes)}]", end=" ")
+        ok = processar_pdf(pdf, client, args.csv_out, colunas,
+                           apagar_apos=args.apagar_pdfs,
+                           forcar_texto=forcar_texto)
+        if ok:
+            sucesso += 1
+        if i < len(pendentes):
+            time.sleep(args.pausa)
+
+    print(f"\n{'='*60}")
+    print(f"  Concluído: {sucesso}/{len(pendentes)} PDFs processados")
+    print(f"  CSV: {args.csv_out.resolve()}")
+    print(f"{'='*60}\n")
+
 
 if __name__ == "__main__":
-    # Demonstração rápida de teste local do agente caso executado de forma isolada
-    try:
-        agent = build_market_agent()
-        
-        # Teste de prompt simulando uma pergunta clássica de um assessor do BTG
-        pergunta = "Quais são os FIIs de Tijolo com os melhores scores disponíveis na base e compare os dois primeiros?"
-        print(f"\n💬 Pergunta do Usuário: '{pergunta}'\n")
-        
-        inputs = {"messages": [("user", pergunta)]}
-        for chunk in agent.stream(inputs, stream_mode="values"):
-            # Exibe o fluxo de mensagens do agente ReAct
-            if "messages" in chunk and chunk["messages"]:
-                ultima_msg = chunk["messages"][-1]
-                if ultima_msg.content.strip():
-                    print(f"🤖 {ultima_msg.type.upper()}: {ultima_msg.content}\n")
-                    
-    except Exception as e:
-        print(f"❌ Erro na execução do Agente de Chat: {e}")
+    main()

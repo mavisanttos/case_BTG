@@ -16,7 +16,7 @@ export function Header() {
             <div className="flex items-center gap-2">
               <span className="text-lg font-bold tracking-tight text-foreground">BTG PACTUAL</span>
               <span className="hidden text-muted-foreground sm:inline">|</span>
-              <span className="hidden text-sm font-medium text-primary sm:inline">Análise de Ofertas Primárias</span>
+              <span className="hidden text-sm font-medium text-primary sm:inline">Prospecto.AI</span>
             </div>
           </div>
         </div>

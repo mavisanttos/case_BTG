@@ -189,7 +189,7 @@ export function FloatingChat({ prospectos }: FloatingChatProps) {
   // Verifica se o backend está rodando
   useEffect(() => {
     if (!isOpen) return
-    fetch('http://localhost:8000/health')
+    fetch('/api/agent/health')
       .then(r => r.json())
       .then(() => setApiStatus('ok'))
       .catch(() => setApiStatus('error'))
@@ -212,7 +212,7 @@ export function FloatingChat({ prospectos }: FloatingChatProps) {
       .map(m => ({ role: m.role, content: m.content }))
 
     try {
-      const res = await fetch('http://localhost:8000/api/chat', {
+      const res = await fetch('/api/agent/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ message: text, history }),

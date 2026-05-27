@@ -12,22 +12,22 @@ O diagrama abaixo ilustra como os dados trafegam pelo sistema, desde a captura n
 
 ```text
  [ Fontes Externas ]       (Portal CVM)                                      (APIs Macroeconômicas)
-                                │                                                      │
-                                ▼                                                      ▼
+                                 │                                                      │
+                                 ▼                                                      ▼
  [ data_ingestion ]    cvm_downloader.py                                 macro_indicators_fetcher.py
                        fetch_cvm_prospectus.py                                         │
-                                │                                                      │
-                                ▼                                                      ▼
+                                 │                                                      │
+                                 ▼                                                      ▼
  [ Armazenamento ]     /data/cvm/ (PDFs e CSVs)            ◄───►                  /data/macro/
-                                │                                                      |
-                                ▼                                                      | 
+                                 │                                                      |
+                                 ▼                                                      | 
  [ Processamento ]    prospect_agent.py  ──► (Extração por IA com Gemini)              |
-                                │                                                      ▼
-                                ▼
+                                 │                                                      ▼
+                                 ▼
  [ Banco de Dados ]    sync_supabase.py                 ──►                  [ SUPABASE (Nuvem) ]
                                                          │
-                              ┌──────────────────────────┴──────────────────────────┐
-                              ▼                                                     ▼
+                               ┌──────────────────────────┴──────────────────────────┐
+                               ▼                                                     ▼
       [ Camada Cliente ]  [ Web App (Next.js) ]                             [ Back-End (FastAPI) ]
                           • Dashboard Analítico                             • market_agent.py (LangChain)
                           • Otimizador de Portfólio                         • Ferramentas ReAct (`@tool`)
@@ -92,9 +92,9 @@ A organização modular do projeto divide as responsabilidades de captura, intel
 
 ## Tecnologias e Ferramentas
 
-- **Back-End / AI Core:** Python 3.10+, LangChain, LangGraph, Google Gemini 2.5 Flash (`langchain-google-genai`), FastAPI, Uvicorn.
-- **Front-End:** Next.js (React 18), Tailwind CSS, Lucide Icons, Recharts (Gráficos Interativos), v0.dev.
-- **Banco de Dados & Infra:** Supabase (PostgreSQL nativo), Jina AI Reader (para raspagem avançada de portais complementares).
+- **Back-End / AI Core:** Python 3.10+, LangChain, LangGraph, Groq Cloud (Llama 3.3 70B), Google Gemini 2.5 Flash, FastAPI, Uvicorn.
+- **Front-End:** Next.js (React 18), Tailwind CSS, Lucide Icons, Recharts (Gráficos Interativos).
+- **Banco de Dados & Infra:** Supabase (PostgreSQL nativo).
 
 ---
 
@@ -106,8 +106,9 @@ Crie um arquivo `.env` na raiz do projeto contendo as credenciais de acesso:
 
 ```env
 SUPABASE_URL=https://seu-projeto.supabase.co
-SUPABASE_SERVICE_ROLE_KEY=sua-chave-service-role
+SUPABASE_KEY=sua-chave-publica-anon-key
 GOOGLE_API_KEY=sua-chave-do-gemini
+GROQ_API_KEY=sua-chave-do-groq
 ```
 
 ### 2. Executando o Pipeline de Dados (Python)
@@ -120,15 +121,20 @@ pip install -r requirements.txt
 
 # 1. Busca indicadores macroeconômicos e estruturais
 python src/data_ingestion/macro_indicators_fetcher.py
+
+# 2. Baixa as tabelas cadastrais de ofertas da CVM
+python src/data_ingestion/cvm_downloader.py
+
+# 3. (Opcional) Download físico dos PDFs dos prospectos (usa Playwright)
 python src/data_ingestion/fetch_cvm_prospectus.py
 
-# 2. Sincroniza e faz o upload em lote de toda a base consolidada para o Supabase
+# 4. Sincroniza e faz o upload em lote de toda a base consolidada para o Supabase
 python src/data_ingestion/sync_supabase.py
 ```
 
 ### 3. Iniciando o Servidor API do Agente de Chat (Back-End)
 
-Para dar vida ao Chatbot inteligente e disponibilizar os endpoints de IA via API Rest utilizando o Uvicorn, execute:
+Para dar vida ao Chatbot e disponibilizar os endpoints de IA via API Rest, execute o comando abaixo (com a raiz no Python Path):
 
 ```bash
 # Certifique-se de que o arquivo principal expõe a instância FastAPI (ex: main.py)
@@ -140,12 +146,21 @@ uvicorn src.agents.market_agent:app --reload --port 8000
 Abra uma nova janela de terminal e ligue a aplicação cliente:
 
 ```bash
-# Navegue até a pasta do app ou execute na raiz dependendo do mapeamento do workspace
+# Navegue até a pasta do app
+cd src/app
+
+# Instale os pacotes e inicie o servidor Next.js
 pnpm install
-pnpm run dev
+pnpm dev
 ```
 
 Acesse o navegador em `http://localhost:3000` para operar o painel integrado.
+
+---
+
+## Apresentação
+
+Para visualizar a apresentação final do projeto, acesse o link: [Apresentação](https://www.figma.com/slides/PuWnR2EIphCmF3gYuUd46E)
 
 ---
 
